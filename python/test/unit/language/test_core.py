@@ -1413,6 +1413,56 @@ def test_num_warps_pow2():
     _kernel[(1,)](dst=dst, num_warps=2)
     _kernel[(1,)](dst=dst, num_warps=4)
 
+
+# -------------
+# test list access
+# -------------
+
+
+def test_access_inline():
+
+    @triton.jit
+    def kernel(X, Out):
+        pid = tl.program_id(0)
+        
+        x0 = tl.load(X + 0)
+        x1 = tl.load(X + 1)
+        
+        # Reverse order!
+        tl.store(Out + 0, x1)
+        tl.store(Out + 1, x0)
+
+    x = torch.tensor([0.0, 1.0], dtype=torch.float32, device='cuda')
+    out_expected = torch.tensor([1.0, 0.0], dtype=torch.float32, device='cuda')
+    out = torch.empty([2], dtype=torch.float32, device='cuda')
+    np_ = lambda x: x.cpu().numpy()
+    kernel[(1,)](x, out)
+    np.testing.assert_almost_equal(np_(out), np_(out_expected))
+
+
+def test_list_access():
+ 
+    @triton.jit
+    def kernel(X, Out):
+        pid = tl.program_id(0)
+        xs = [0, 0]
+        
+        for i in range(2):
+            xs[i] = tl.load(X + i)
+        
+        # Reverse order!
+        
+        for i in range(2):
+            tl.store(Out + (1 - i), xs[i])
+
+    x = torch.tensor([0.0, 1.0], dtype=torch.float32, device='cuda')
+    out_expected = torch.tensor([1.0, 0.0], dtype=torch.float32, device='cuda')
+    out = torch.empty([2], dtype=torch.float32, device='cuda')
+    np_ = lambda x: x.cpu().numpy()
+    kernel[(1,)](x, out)
+    np.testing.assert_almost_equal(np_(out), np_(out_expected))
+
+
 # -------------
 # test extern
 # -------------

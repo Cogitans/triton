@@ -36,6 +36,10 @@ def current_cuda_stream(device_idx=0):
     return get_cuda_stream(device_idx)
 
 
+def make_list_inline_var_name(list_name, index_name):
+    return f"{list_name}_{index_name}"
+
+
 def mangle_ty(ty):
     if ty.is_ptr():
         return 'P' + mangle_ty(ty.element_ty)
@@ -342,6 +346,11 @@ class CodeGenerator(ast.NodeVisitor):
         return self.visit_Assign(node)
 
     def visit_Assign(self, node):
+        # We want to support list assignments like xs = [tensor1, tensor2]
+        is_list_assignment = False
+        if isinstance(node.value, ast.List) and len(node.targets) == 1:
+            is_list_assignment = True
+
         _names = []
         for target in node.targets:
             _names += [self.visit(target)]
@@ -359,16 +368,24 @@ class CodeGenerator(ast.NodeVisitor):
             values = [self.builder.extract_value(struct, i) for i in range(len(tys))]
             values = [triton.language.tensor(v, ty) for v, ty in zip(values, tys)]
         assert len(values) == len(names)
-        for name, value in zip(names, values):
-            # TODO: can we store constexpr here to support constant folding?
-            # by default, constexpr are assigned into python variable
-            if isinstance(value, triton.language.constexpr):
-                value = value.value
-            if value is None:
-                raise ValueError(f'Cannot assign None to non-constexpr `{name}`. Please annotate as `: tl.constexpr`')
-            if not isinstance(value, triton.language.tensor):
-                value = triton.language.core._to_tensor(value, self.builder)
-            self.value_constructor.set_value(name, value)
+        for i, (name, value) in enumerate(zip(names, values)):
+            if is_list_assignment:
+                if all(isinstance(triton.language.core._to_tensor(v, self.builder), triton.language.tensor) for v in value):
+                    for j in range(len(value)):
+                        self.value_constructor.set_value(
+                            make_list_inline_var_name(name, j), value[j])
+                else:
+                    raise ValueError(f"Cannot parse list assignment from {value} to {name}.")
+            else:
+                # TODO: can we store constexpr here to support constant folding?
+                # by default, constexpr are assigned into python variable
+                if isinstance(value, triton.language.constexpr):
+                    value = value.value
+                if value is None:
+                    raise ValueError(f'Cannot assign None to non-constexpr `{name}`. Please annotate as `: tl.constexpr`')
+                if not isinstance(value, triton.language.tensor):
+                    value = triton.language.core._to_tensor(value, self.builder)
+                self.value_constructor.set_value(name, value)
 
     def visit_AugAssign(self, node):
         name = node.target.id
@@ -556,12 +573,27 @@ class CodeGenerator(ast.NodeVisitor):
             ast.NodeVisitor.generic_visit(self, stmt)
 
     def visit_Subscript(self, node):
-        assert node.ctx.__class__.__name__ == "Load"
-        lhs = self.visit(node.value)
+        subscript_type = node.ctx.__class__.__name__
+        assert subscript_type in ["Load", "Store"]
         slices = self.visit(node.slice)
-        if is_triton_tensor(lhs):
-            return lhs.__getitem__(slices, _builder=self.builder)
-        return lhs[slices]
+        if subscript_type == "Load":
+            try:
+                # First do a constexpr lookup.
+                lhs = self.visit(node.value)
+            except ValueError as e:
+                # Then, try a var lookup.
+                try:
+                    return self.value_constructor.get_value(make_list_inline_var_name(
+                        node.value.id, slices.value))
+                except Exception as e2:
+                    raise e2 from e
+
+            if is_triton_tensor(lhs):
+                return lhs.__getitem__(slices, _builder=self.builder)
+            return lhs[slices]
+        else:
+            return make_list_inline_var_name(node.value.id, slices.value)
+            
 
     def visit_ExtSlice(self, node):
         return [self.visit(dim) for dim in node.dims]
